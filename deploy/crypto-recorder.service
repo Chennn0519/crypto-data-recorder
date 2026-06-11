@@ -1,0 +1,16 @@
+[Unit]
+Description=crypto-data-recorder: 24/7 market data recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/crypto-data-recorder
+ExecStart=/opt/crypto-data-recorder/.venv/bin/python recorder.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
