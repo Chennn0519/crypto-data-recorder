@@ -284,7 +284,9 @@ def _call_with_retry(stop: threading.Event, name: str, fn) -> None:
 
 async def _ws_main(stop: threading.Event) -> None:
     streams = "/".join(f"{s.lower()}@forceOrder" for s in CONFIG["symbols"])
-    url = f"{CONFIG['ws_url_base']}/stream?streams={streams}"
+    # forceOrder lives on the /market route; legacy unrouted /stream URLs were
+    # decommissioned 2026-04-23 (they connect fine but push no data)
+    url = f"{CONFIG['ws_url_base']}/market/stream?streams={streams}"
     backoff = 1
     while not stop.is_set():
         try:
