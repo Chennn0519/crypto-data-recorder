@@ -1,0 +1,13 @@
+# Recorded data and logs never enter version control
+data/
+logs/
+*.jsonl
+*.jsonl.gz
+*.gz
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
