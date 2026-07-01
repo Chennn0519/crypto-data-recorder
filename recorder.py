@@ -3,6 +3,7 @@
 
 Records (all free public endpoints, no API keys):
   oi                  Binance futures open interest history (5m bars, REST poll)
+  oi_1m               Binance futures open interest, instantaneous value (REST, 1m)
   lsr_global_account  Binance global long/short account ratio (5m bars, REST poll)
   lsr_top_account     Binance top trader long/short account ratio (5m bars, REST poll)
   lsr_top_position    Binance top trader long/short position ratio (5m bars, REST poll)
@@ -10,13 +11,20 @@ Records (all free public endpoints, no API keys):
   liquidation         Binance futures forced liquidation orders (websocket;
                       exchange pushes at most 1 order per second per symbol,
                       i.e. this stream is a sample, not the full flow)
+  mark                Binance mark/index price + funding rate (websocket 1s
+                      stream, sampled to 1 record per minute)
   depth               Binance futures order book snapshot, top 100 levels (REST, 1m)
+  depth20             raw top-20 order book snapshot (websocket, every 30s)
+  depth_imbalance     derived order-book imbalance features computed from the
+                      top-20 websocket book (every 5s) -- the only derived
+                      stream; the raw book it is computed from is kept in depth20
   options_deribit     Deribit option chain book summary (REST, 1h)
 
 Every record is one JSON line with two timestamps:
   ts_local  local receive time (UTC, ms since epoch)
   ts_event  exchange-reported event time (UTC, ms; null if the source has none)
-The raw exchange payload is kept unmodified under "data".
+The raw exchange payload is kept unmodified under "data" (except depth_imbalance,
+whose "data" holds the computed features).
 
 Files: data/<type>/<YYYY-MM-DD>.jsonl (UTC date). On daily rotation,
 previous days are gzipped in the background.
@@ -52,12 +60,17 @@ CONFIG = {
     "deribit_currencies": ["BTC"],       # Deribit option chains
     "intervals": {                       # seconds
         "bars": 300,        # oi + the four long/short ratios (5m bars)
-        "depth": 60,
+        "oi_1m": 60,        # instantaneous open interest, finer than the 5m bars
+        "depth": 60,        # REST top-100 snapshot
+        "depth_imbalance": 5,   # derived order-book imbalance from the ws book
+        "depth_raw": 30,        # raw top-20 book snapshot from the ws book
+        "mark": 60,             # mark/index/funding, aggregated from the 1s stream
         "options": 3600,
         "heartbeat": 3600,
     },
     "bar_poll_offset": 30,  # poll 5m endpoints 30s after the bar boundary
     "depth_limit": 100,
+    "depth_ws_levels": 20,  # partial-book-depth stream depth (5/10/20 allowed)
     "http_timeout": 10,
     "ws_url_base": "wss://fstream.binance.com",
     "binance_base": "https://fapi.binance.com",
@@ -227,6 +240,30 @@ def fetch_depth() -> None:
         })
 
 
+def fetch_oi_1m() -> None:
+    """Instantaneous open interest per symbol, polled every minute.
+
+    The 5m `oi` stream uses openInterestHist, whose bars only update every
+    5 minutes. This uses the current-value endpoint so open interest can be
+    sampled at 1-minute grid resolution. Kept as a separate stream so the
+    coarser historical `oi` series stays continuous.
+    """
+    for symbol in CONFIG["symbols"]:
+        r = SESSION.get(
+            CONFIG["binance_base"] + "/fapi/v1/openInterest",
+            params={"symbol": symbol},
+            timeout=CONFIG["http_timeout"],
+        )
+        r.raise_for_status()
+        resp = r.json()
+        WRITER.write("oi_1m", {
+            "ts_local": now_ms(),
+            "ts_event": resp.get("time"),  # exchange server time of the value
+            "symbol": symbol,
+            "data": resp,
+        })
+
+
 def fetch_options() -> None:
     """Deribit option chain book summary; one line per instrument,
     grouped by snapshot_ts (local request time of the snapshot)."""
@@ -327,6 +364,172 @@ def ws_thread(stop: threading.Event) -> None:
     asyncio.run(_ws_main(stop))
 
 
+# ---------------------------------------------------------------- mark price ws
+
+def _flush_mark(latest: dict) -> None:
+    """Write one mark-price record per symbol (the last tick of the minute)."""
+    for symbol, (ts_local, data) in latest.items():
+        WRITER.write("mark", {
+            "ts_local": ts_local,
+            "ts_event": data.get("E"),
+            "symbol": symbol,
+            "data": data,   # raw payload: p=mark, i=index, r=funding, T=next funding
+        })
+
+
+async def _mark_ws_main(stop: threading.Event) -> None:
+    streams = "/".join(f"{s.lower()}@markPrice@1s" for s in CONFIG["symbols"])
+    # markPrice lives on the /market route (see the 2026-04-23 route change)
+    url = f"{CONFIG['ws_url_base']}/market/stream?streams={streams}"
+    backoff = 1
+    while not stop.is_set():
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                log.info("markPrice websocket connected (%s)", streams)
+                connected_at = time.time()
+                latest = {}                        # symbol -> (ts_local, data)
+                last_minute = int(time.time() // 60)
+                while not stop.is_set():
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2)
+                    except asyncio.TimeoutError:
+                        msg = None
+                    if msg is not None:
+                        data = json.loads(msg).get("data", {})
+                        if data.get("e") == "markPriceUpdate":
+                            latest[data.get("s")] = (now_ms(), data)
+                        if time.time() - connected_at > 60:
+                            backoff = 1
+                    cur_minute = int(time.time() // 60)
+                    if cur_minute != last_minute:
+                        _flush_mark(latest)        # sample the last tick per minute
+                        last_minute = cur_minute
+        except Exception as e:
+            if stop.is_set():
+                break
+            log.warning("markPrice websocket error: %s; reconnecting in %ds", e, backoff)
+            deadline = time.time() + backoff
+            while time.time() < deadline and not stop.is_set():
+                await asyncio.sleep(0.5)
+            backoff = min(backoff * 2, 60)
+    log.info("markPrice websocket stopped")
+
+
+def mark_ws_thread(stop: threading.Event) -> None:
+    asyncio.run(_mark_ws_main(stop))
+
+
+# ---------------------------------------------------------------- depth book ws
+
+def compute_imbalance(bids: list, asks: list) -> dict | None:
+    """Order-book imbalance features from raw top-N bid/ask level lists.
+
+    bids are [price, qty] descending, asks ascending. Returns None if either
+    side is empty. All quantities are in base asset (contracts), prices quote.
+    imbalance_N is in [-1, 1]: +1 all bids, -1 all asks.
+    """
+    b = [(float(p), float(q)) for p, q in bids]
+    a = [(float(p), float(q)) for p, q in asks]
+    if not b or not a:
+        return None
+    best_bid, best_ask = b[0][0], a[0][0]
+    mid = (best_bid + best_ask) / 2
+    out = {"mid": mid, "spread": best_ask - best_bid,
+           "best_bid": best_bid, "best_ask": best_ask}
+    for n in (5, 10, 20):
+        bq = sum(q for _, q in b[:n])
+        aq = sum(q for _, q in a[:n])
+        tot = bq + aq
+        out[f"bid_qty_{n}"] = bq
+        out[f"ask_qty_{n}"] = aq
+        out[f"imbalance_{n}"] = (bq - aq) / tot if tot else 0.0
+    for label, pct in (("0p5pct", 0.005), ("1pct", 0.01)):
+        lo, hi = mid * (1 - pct), mid * (1 + pct)
+        out[f"bid_within_{label}"] = sum(q for p, q in b if p >= lo)
+        out[f"ask_within_{label}"] = sum(q for p, q in a if p <= hi)
+    return out
+
+
+def _flush_imbalance(book: dict) -> None:
+    ts_local = now_ms()
+    for symbol, (_, ts_event, bids, asks) in book.items():
+        feat = compute_imbalance(bids, asks)
+        if feat is None:
+            continue
+        WRITER.write("depth_imbalance", {
+            "ts_local": ts_local,
+            "ts_event": ts_event,
+            "symbol": symbol,
+            "data": feat,
+        })
+
+
+def _flush_depth_raw(book: dict) -> None:
+    ts_local = now_ms()
+    for symbol, (_, ts_event, bids, asks) in book.items():
+        WRITER.write("depth20", {
+            "ts_local": ts_local,
+            "ts_event": ts_event,
+            "symbol": symbol,
+            "data": {"bids": bids, "asks": asks},
+        })
+
+
+async def _depth_ws_main(stop: threading.Event) -> None:
+    lvl = CONFIG["depth_ws_levels"]
+    streams = "/".join(f"{s.lower()}@depth{lvl}@100ms" for s in CONFIG["symbols"])
+    # partial-book-depth streams are on the /public route (not /market)
+    url = f"{CONFIG['ws_url_base']}/public/stream?streams={streams}"
+    imb_iv = CONFIG["intervals"]["depth_imbalance"]
+    raw_iv = CONFIG["intervals"]["depth_raw"]
+    backoff = 1
+    while not stop.is_set():
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                log.info("depth websocket connected (%s)", streams)
+                connected_at = time.time()
+                book = {}   # symbol -> (ts_recv, ts_event, bids, asks)
+                now = time.time()
+                next_imb = now - now % imb_iv + imb_iv
+                next_raw = now - now % raw_iv + raw_iv
+                while not stop.is_set():
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2)
+                    except asyncio.TimeoutError:
+                        msg = None
+                    if msg is not None:
+                        data = json.loads(msg).get("data", {})
+                        if data.get("e") == "depthUpdate" and data.get("b") is not None:
+                            book[data.get("s")] = (now_ms(), data.get("T") or data.get("E"),
+                                                   data.get("b"), data.get("a"))
+                        if time.time() - connected_at > 60:
+                            backoff = 1
+                    now = time.time()
+                    if now >= next_imb:
+                        _flush_imbalance(book)
+                        next_imb += imb_iv
+                        if now >= next_imb:            # fell behind: realign
+                            next_imb = now - now % imb_iv + imb_iv
+                    if now >= next_raw:
+                        _flush_depth_raw(book)
+                        next_raw += raw_iv
+                        if now >= next_raw:
+                            next_raw = now - now % raw_iv + raw_iv
+        except Exception as e:
+            if stop.is_set():
+                break
+            log.warning("depth websocket error: %s; reconnecting in %ds", e, backoff)
+            deadline = time.time() + backoff
+            while time.time() < deadline and not stop.is_set():
+                await asyncio.sleep(0.5)
+            backoff = min(backoff * 2, 60)
+    log.info("depth websocket stopped")
+
+
+def depth_ws_thread(stop: threading.Event) -> None:
+    asyncio.run(_depth_ws_main(stop))
+
+
 # ---------------------------------------------------------------- heartbeat
 
 def heartbeat_loop(stop: threading.Event, started: float) -> None:
@@ -371,11 +574,15 @@ def main() -> None:
     threads = [
         threading.Thread(target=poll_loop, name="bars",
                          args=(stop, "bars", iv["bars"], CONFIG["bar_poll_offset"], fetch_bars)),
+        threading.Thread(target=poll_loop, name="oi_1m",
+                         args=(stop, "oi_1m", iv["oi_1m"], 0, fetch_oi_1m)),
         threading.Thread(target=poll_loop, name="depth",
                          args=(stop, "depth", iv["depth"], 0, fetch_depth)),
         threading.Thread(target=poll_loop, name="options",
                          args=(stop, "options", iv["options"], 0, fetch_options)),
         threading.Thread(target=ws_thread, name="ws", args=(stop,)),
+        threading.Thread(target=mark_ws_thread, name="mark_ws", args=(stop,)),
+        threading.Thread(target=depth_ws_thread, name="depth_ws", args=(stop,)),
         threading.Thread(target=heartbeat_loop, name="heartbeat", args=(stop, started)),
     ]
     for t in threads:

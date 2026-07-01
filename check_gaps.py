@@ -26,11 +26,15 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 # bar time, snapshots by local receive time)
 TYPES = {
     "oi":                 {"interval": 300,  "ts": "ts_event"},
+    "oi_1m":              {"interval": 60,   "ts": "ts_event"},
     "lsr_global_account": {"interval": 300,  "ts": "ts_event"},
     "lsr_top_account":    {"interval": 300,  "ts": "ts_event"},
     "lsr_top_position":   {"interval": 300,  "ts": "ts_event"},
     "lsr_taker":          {"interval": 300,  "ts": "ts_event"},
+    "mark":               {"interval": 60,   "ts": "ts_local"},
     "depth":              {"interval": 60,   "ts": "ts_local"},
+    "depth_imbalance":    {"interval": 5,    "ts": "ts_local"},
+    "depth20":            {"interval": 30,   "ts": "ts_local"},
     "options_deribit":    {"interval": 3600, "ts": "ts_local", "group": "snapshot_ts"},
     "liquidation":        {"interval": None, "ts": "ts_local"},
 }
