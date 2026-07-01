@@ -56,7 +56,7 @@ import websockets
 # ---------------------------------------------------------------- config
 
 CONFIG = {
-    "symbols": ["BTCUSDT", "ETHUSDT"],   # Binance USDT-M futures
+    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],   # Binance USDT-M futures
     "deribit_currencies": ["BTC"],       # Deribit option chains
     "intervals": {                       # seconds
         "bars": 300,        # oi + the four long/short ratios (5m bars)
