@@ -34,7 +34,7 @@ TYPES = {
     "mark":               {"interval": 60,   "ts": "ts_local"},
     "depth":              {"interval": 60,   "ts": "ts_local"},
     "depth_imbalance":    {"interval": 5,    "ts": "ts_local"},
-    "depth20":            {"interval": 30,   "ts": "ts_local"},
+    "depth20":            {"interval": 10,   "ts": "ts_local"},
     "options_deribit":    {"interval": 3600, "ts": "ts_local", "group": "snapshot_ts"},
     "liquidation":        {"interval": None, "ts": "ts_local"},
 }

@@ -63,7 +63,7 @@ CONFIG = {
         "oi_1m": 60,        # instantaneous open interest, finer than the 5m bars
         "depth": 60,        # REST top-100 snapshot
         "depth_imbalance": 5,   # derived order-book imbalance from the ws book
-        "depth_raw": 30,        # raw top-20 book snapshot from the ws book
+        "depth_raw": 10,        # raw top-20 book snapshot from the ws book
         "mark": 60,             # mark/index/funding, aggregated from the 1s stream
         "options": 3600,
         "heartbeat": 3600,
@@ -462,7 +462,7 @@ def compute_imbalance(bids: list, asks: list) -> dict | None:
         out[f"bid_qty_{n}"] = bq
         out[f"ask_qty_{n}"] = aq
         out[f"imbalance_{n}"] = (bq - aq) / tot if tot else 0.0
-    for label, pct in (("0p5pct", 0.005), ("1pct", 0.01)):
+    for label, pct in (("0p1pct", 0.001), ("0p5pct", 0.005), ("1pct", 0.01)):
         lo, hi = mid * (1 - pct), mid * (1 + pct)
         out[f"bid_within_{label}"] = sum(q for p, q in b if p >= lo)
         out[f"ask_within_{label}"] = sum(q for p, q in a if p <= hi)
@@ -471,7 +471,7 @@ def compute_imbalance(bids: list, asks: list) -> dict | None:
 
 def _flush_imbalance(book: dict, max_age_ms: int) -> None:
     ts_local = now_ms()
-    for symbol, (ts_recv, ts_event, bids, asks) in book.items():
+    for symbol, (ts_recv, ts_event, bids, asks, _seq) in book.items():
         if ts_local - ts_recv > max_age_ms:
             continue   # stale book: skip so the gap stays visible in the data
         feat = compute_imbalance(bids, asks)
@@ -487,14 +487,14 @@ def _flush_imbalance(book: dict, max_age_ms: int) -> None:
 
 def _flush_depth_raw(book: dict, max_age_ms: int) -> None:
     ts_local = now_ms()
-    for symbol, (ts_recv, ts_event, bids, asks) in book.items():
+    for symbol, (ts_recv, ts_event, bids, asks, seq) in book.items():
         if ts_local - ts_recv > max_age_ms:
             continue   # stale book: skip so the gap stays visible in the data
         WRITER.write("depth20", {
             "ts_local": ts_local,
             "ts_event": ts_event,
             "symbol": symbol,
-            "data": {"bids": bids, "asks": asks},
+            "data": {**seq, "bids": bids, "asks": asks},
         })
 
 
@@ -513,7 +513,7 @@ async def _depth_ws_main(stop: threading.Event) -> None:
                 connected_at = time.time()
                 stale_after = CONFIG["ws_stale_secs"]["depth"]
                 last_msg = time.time()
-                book = {}   # symbol -> (ts_recv, ts_event, bids, asks)
+                book = {}   # symbol -> (ts_recv, ts_event, bids, asks, seq)
                 now = time.time()
                 next_imb = now - now % imb_iv + imb_iv
                 next_raw = now - now % raw_iv + raw_iv
@@ -526,8 +526,11 @@ async def _depth_ws_main(stop: threading.Event) -> None:
                         last_msg = time.time()
                         data = json.loads(msg).get("data", {})
                         if data.get("e") == "depthUpdate" and data.get("b") is not None:
+                            # U/u/pu are Binance update ids; kept on the raw
+                            # snapshot so dropped frames are detectable later
+                            seq = {"U": data.get("U"), "u": data.get("u"), "pu": data.get("pu")}
                             book[data.get("s")] = (now_ms(), data.get("T") or data.get("E"),
-                                                   data.get("b"), data.get("a"))
+                                                   data.get("b"), data.get("a"), seq)
                         if time.time() - connected_at > 60:
                             backoff = 1
                     elif time.time() - last_msg > stale_after:
