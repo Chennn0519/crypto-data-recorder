@@ -72,6 +72,11 @@ CONFIG = {
     "depth_limit": 100,
     "depth_ws_levels": 20,  # partial-book-depth stream depth (5/10/20 allowed)
     "http_timeout": 10,
+    "ws_stale_secs": {      # force a reconnect after this long with no stream data
+        "liquidation": 1800,    # sparse stream: quiet markets can pause it for a while
+        "mark": 60,             # markPrice@1s: normally ticks every second
+        "depth": 60,            # depth20@100ms: normally ticks many times per second
+    },
     "ws_url_base": "wss://fstream.binance.com",
     "binance_base": "https://fapi.binance.com",
     "deribit_base": "https://www.deribit.com",
@@ -330,11 +335,19 @@ async def _ws_main(stop: threading.Event) -> None:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                 log.info("liquidation websocket connected (%s)", streams)
                 connected_at = time.time()
+                stale_after = CONFIG["ws_stale_secs"]["liquidation"]
+                last_msg = time.time()
                 while not stop.is_set():
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=5)
                     except asyncio.TimeoutError:
+                        # a connection can stay open but silently stop pushing
+                        # (seen 2026-04-23 with the legacy /stream routes)
+                        if time.time() - last_msg > stale_after:
+                            raise RuntimeError(
+                                f"no stream data for {stale_after}s") from None
                         continue
+                    last_msg = time.time()
                     ts_local = now_ms()
                     payload = json.loads(msg)
                     data = payload.get("data", payload)
@@ -387,6 +400,8 @@ async def _mark_ws_main(stop: threading.Event) -> None:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                 log.info("markPrice websocket connected (%s)", streams)
                 connected_at = time.time()
+                stale_after = CONFIG["ws_stale_secs"]["mark"]
+                last_msg = time.time()
                 latest = {}                        # symbol -> (ts_local, data)
                 last_minute = int(time.time() // 60)
                 while not stop.is_set():
@@ -395,14 +410,18 @@ async def _mark_ws_main(stop: threading.Event) -> None:
                     except asyncio.TimeoutError:
                         msg = None
                     if msg is not None:
+                        last_msg = time.time()
                         data = json.loads(msg).get("data", {})
                         if data.get("e") == "markPriceUpdate":
                             latest[data.get("s")] = (now_ms(), data)
                         if time.time() - connected_at > 60:
                             backoff = 1
+                    elif time.time() - last_msg > stale_after:
+                        raise RuntimeError(f"no stream data for {stale_after}s")
                     cur_minute = int(time.time() // 60)
                     if cur_minute != last_minute:
                         _flush_mark(latest)        # sample the last tick per minute
+                        latest.clear()             # never re-write a stale tick
                         last_minute = cur_minute
         except Exception as e:
             if stop.is_set():
@@ -450,9 +469,11 @@ def compute_imbalance(bids: list, asks: list) -> dict | None:
     return out
 
 
-def _flush_imbalance(book: dict) -> None:
+def _flush_imbalance(book: dict, max_age_ms: int) -> None:
     ts_local = now_ms()
-    for symbol, (_, ts_event, bids, asks) in book.items():
+    for symbol, (ts_recv, ts_event, bids, asks) in book.items():
+        if ts_local - ts_recv > max_age_ms:
+            continue   # stale book: skip so the gap stays visible in the data
         feat = compute_imbalance(bids, asks)
         if feat is None:
             continue
@@ -464,9 +485,11 @@ def _flush_imbalance(book: dict) -> None:
         })
 
 
-def _flush_depth_raw(book: dict) -> None:
+def _flush_depth_raw(book: dict, max_age_ms: int) -> None:
     ts_local = now_ms()
-    for symbol, (_, ts_event, bids, asks) in book.items():
+    for symbol, (ts_recv, ts_event, bids, asks) in book.items():
+        if ts_local - ts_recv > max_age_ms:
+            continue   # stale book: skip so the gap stays visible in the data
         WRITER.write("depth20", {
             "ts_local": ts_local,
             "ts_event": ts_event,
@@ -488,6 +511,8 @@ async def _depth_ws_main(stop: threading.Event) -> None:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                 log.info("depth websocket connected (%s)", streams)
                 connected_at = time.time()
+                stale_after = CONFIG["ws_stale_secs"]["depth"]
+                last_msg = time.time()
                 book = {}   # symbol -> (ts_recv, ts_event, bids, asks)
                 now = time.time()
                 next_imb = now - now % imb_iv + imb_iv
@@ -498,20 +523,23 @@ async def _depth_ws_main(stop: threading.Event) -> None:
                     except asyncio.TimeoutError:
                         msg = None
                     if msg is not None:
+                        last_msg = time.time()
                         data = json.loads(msg).get("data", {})
                         if data.get("e") == "depthUpdate" and data.get("b") is not None:
                             book[data.get("s")] = (now_ms(), data.get("T") or data.get("E"),
                                                    data.get("b"), data.get("a"))
                         if time.time() - connected_at > 60:
                             backoff = 1
+                    elif time.time() - last_msg > stale_after:
+                        raise RuntimeError(f"no stream data for {stale_after}s")
                     now = time.time()
                     if now >= next_imb:
-                        _flush_imbalance(book)
+                        _flush_imbalance(book, imb_iv * 2000)   # ms; 2x interval
                         next_imb += imb_iv
                         if now >= next_imb:            # fell behind: realign
                             next_imb = now - now % imb_iv + imb_iv
                     if now >= next_raw:
-                        _flush_depth_raw(book)
+                        _flush_depth_raw(book, raw_iv * 2000)
                         next_raw += raw_iv
                         if now >= next_raw:
                             next_raw = now - now % raw_iv + raw_iv
