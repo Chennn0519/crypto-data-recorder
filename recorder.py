@@ -14,10 +14,16 @@ Records (all free public endpoints, no API keys):
   mark                Binance mark/index price + funding rate (websocket 1s
                       stream, sampled to 1 record per minute)
   depth               Binance futures order book snapshot, top 100 levels (REST, 1m)
-  depth20             raw top-20 order book snapshot (websocket, every 30s)
+  depth20             raw top-20 order book snapshot (websocket, every 10s)
+  depth20_stream      raw top-20 order book, EVERY exchange push (~100ms per
+                      symbol; full event stream for microstructure research).
+                      A top-level "gap": true marks a record whose pu does not
+                      chain to the previous record's u (dropped frames or
+                      reconnect -- the missing span is exchange-side lost)
   depth_imbalance     derived order-book imbalance features computed from the
                       top-20 websocket book (every 5s) -- the only derived
                       stream; the raw book it is computed from is kept in depth20
+  aggtrade            Binance futures aggregated trades, every event (websocket)
   options_deribit     Deribit option chain book summary (REST, 1h)
 
 Every record is one JSON line with two timestamps:
@@ -76,6 +82,7 @@ CONFIG = {
         "liquidation": 1800,    # sparse stream: quiet markets can pause it for a while
         "mark": 60,             # markPrice@1s: normally ticks every second
         "depth": 60,            # depth20@100ms: normally ticks many times per second
+        "aggtrade": 120,        # BTC trades near-continuously; 2min silence = dead
     },
     "ws_url_base": "wss://fstream.binance.com",
     "binance_base": "https://fapi.binance.com",
@@ -506,6 +513,9 @@ async def _depth_ws_main(stop: threading.Event) -> None:
     imb_iv = CONFIG["intervals"]["depth_imbalance"]
     raw_iv = CONFIG["intervals"]["depth_raw"]
     backoff = 1
+    # last update id per symbol, kept ACROSS reconnects so frames lost during
+    # a reconnect are flagged as a gap on the first record after it
+    prev_u: dict[str, int] = {}
     while not stop.is_set():
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
@@ -529,8 +539,19 @@ async def _depth_ws_main(stop: threading.Event) -> None:
                             # U/u/pu are Binance update ids; kept on the raw
                             # snapshot so dropped frames are detectable later
                             seq = {"U": data.get("U"), "u": data.get("u"), "pu": data.get("pu")}
-                            book[data.get("s")] = (now_ms(), data.get("T") or data.get("E"),
-                                                   data.get("b"), data.get("a"), seq)
+                            symbol = data.get("s")
+                            ts_recv = now_ms()
+                            ts_event = data.get("T") or data.get("E")
+                            book[symbol] = (ts_recv, ts_event,
+                                            data.get("b"), data.get("a"), seq)
+                            # full event stream: one record per exchange push
+                            rec = {"ts_local": ts_recv, "ts_event": ts_event,
+                                   "symbol": symbol, "data": data}
+                            last_u = prev_u.get(symbol)
+                            if last_u is not None and data.get("pu") != last_u:
+                                rec["gap"] = True
+                            prev_u[symbol] = data.get("u")
+                            WRITER.write("depth20_stream", rec)
                         if time.time() - connected_at > 60:
                             backoff = 1
                     elif time.time() - last_msg > stale_after:
@@ -559,6 +580,57 @@ async def _depth_ws_main(stop: threading.Event) -> None:
 
 def depth_ws_thread(stop: threading.Event) -> None:
     asyncio.run(_depth_ws_main(stop))
+
+
+# ---------------------------------------------------------------- aggTrade ws
+
+async def _aggtrade_ws_main(stop: threading.Event) -> None:
+    streams = "/".join(f"{s.lower()}@aggTrade" for s in CONFIG["symbols"])
+    # aggTrade lives on the /market route (verified 2026-07-06: /public
+    # connects but pushes no data, same trap as the 2026-04-23 route change)
+    url = f"{CONFIG['ws_url_base']}/market/stream?streams={streams}"
+    backoff = 1
+    while not stop.is_set():
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                log.info("aggTrade websocket connected (%s)", streams)
+                connected_at = time.time()
+                stale_after = CONFIG["ws_stale_secs"]["aggtrade"]
+                last_msg = time.time()
+                while not stop.is_set():
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                    except asyncio.TimeoutError:
+                        if time.time() - last_msg > stale_after:
+                            raise RuntimeError(
+                                f"no stream data for {stale_after}s") from None
+                        continue
+                    last_msg = time.time()
+                    ts_local = now_ms()
+                    data = json.loads(msg).get("data", {})
+                    if data.get("e") != "aggTrade":
+                        continue
+                    WRITER.write("aggtrade", {
+                        "ts_local": ts_local,
+                        "ts_event": data.get("T"),   # trade time
+                        "symbol": data.get("s"),
+                        "data": data,
+                    })
+                    if time.time() - connected_at > 60:
+                        backoff = 1
+        except Exception as e:
+            if stop.is_set():
+                break
+            log.warning("aggTrade websocket error: %s; reconnecting in %ds", e, backoff)
+            deadline = time.time() + backoff
+            while time.time() < deadline and not stop.is_set():
+                await asyncio.sleep(0.5)
+            backoff = min(backoff * 2, 60)
+    log.info("aggTrade websocket stopped")
+
+
+def aggtrade_ws_thread(stop: threading.Event) -> None:
+    asyncio.run(_aggtrade_ws_main(stop))
 
 
 # ---------------------------------------------------------------- heartbeat
@@ -614,6 +686,7 @@ def main() -> None:
         threading.Thread(target=ws_thread, name="ws", args=(stop,)),
         threading.Thread(target=mark_ws_thread, name="mark_ws", args=(stop,)),
         threading.Thread(target=depth_ws_thread, name="depth_ws", args=(stop,)),
+        threading.Thread(target=aggtrade_ws_thread, name="aggtrade_ws", args=(stop,)),
         threading.Thread(target=heartbeat_loop, name="heartbeat", args=(stop, started)),
     ]
     for t in threads:

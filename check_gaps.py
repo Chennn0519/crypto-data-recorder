@@ -35,8 +35,12 @@ TYPES = {
     "depth":              {"interval": 60,   "ts": "ts_local"},
     "depth_imbalance":    {"interval": 5,    "ts": "ts_local"},
     "depth20":            {"interval": 10,   "ts": "ts_local"},
+    # nominal push rate is ~100ms/symbol; 1s (x1.6 factor) only flags real
+    # outages, not scheduling jitter
+    "depth20_stream":     {"interval": 1,    "ts": "ts_local"},
     "options_deribit":    {"interval": 3600, "ts": "ts_local", "group": "snapshot_ts"},
     "liquidation":        {"interval": None, "ts": "ts_local"},
+    "aggtrade":           {"interval": None, "ts": "ts_local"},
 }
 GAP_FACTOR = 1.6
 
@@ -116,8 +120,9 @@ def main():
               f"{age_s:>8}{gap_str:>6}{max_str:>11}")
 
     print()
-    print("note: liquidation is event-driven (exchange samples max 1/s/symbol);")
-    print("      no gap metric applies, only the last event time.")
+    print("note: liquidation and aggtrade are event-driven; no gap metric applies,")
+    print("      only the last event time. depth20_stream gaps also carry an")
+    print('      in-record "gap": true flag from update-id chain breaks.')
 
 
 if __name__ == "__main__":

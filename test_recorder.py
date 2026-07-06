@@ -52,7 +52,8 @@ class StaleFlushTest(unittest.TestCase):
 
     def _book(self, age_ms):
         ts_recv = recorder.now_ms() - age_ms
-        return {"BTCUSDT": (ts_recv, ts_recv, [["100", "2"]], [["101", "1"]])}
+        seq = {"U": 10, "u": 12, "pu": 9}
+        return {"BTCUSDT": (ts_recv, ts_recv, [["100", "2"]], [["101", "1"]], seq)}
 
     def test_fresh_book_is_written(self):
         recorder._flush_imbalance(self._book(age_ms=1_000), max_age_ms=10_000)

@@ -13,16 +13,22 @@ or backfills. All sources are free public endpoints, no API keys required.
 | type | source | cadence |
 |---|---|---|
 | `oi` | Binance `/futures/data/openInterestHist` (free API only keeps 30 days) | 5m |
+| `oi_1m` | Binance `/fapi/v1/openInterest` instantaneous value | 1m |
 | `lsr_global_account` | Binance `/futures/data/globalLongShortAccountRatio` | 5m |
 | `lsr_top_account` | Binance `/futures/data/topLongShortAccountRatio` | 5m |
 | `lsr_top_position` | Binance `/futures/data/topLongShortPositionRatio` | 5m |
 | `lsr_taker` | Binance `/futures/data/takerlongshortRatio` | 5m |
 | `liquidation` | Binance websocket `<symbol>@forceOrder` (exchange pushes at most 1 order/s/symbol — a sample, not the full flow) | realtime |
+| `mark` | Binance websocket `<symbol>@markPrice@1s` (mark/index/funding), sampled | 1m |
 | `depth` | Binance `/fapi/v1/depth?limit=100` order book snapshot | 1m |
+| `depth20` | raw top-20 book snapshot from the websocket stream | 10s |
+| `depth20_stream` | raw top-20 book, every exchange push (`<symbol>@depth20@100ms`); records flag update-id chain breaks with `"gap": true` | ~100ms |
+| `depth_imbalance` | derived imbalance features from the top-20 websocket book | 5s |
+| `aggtrade` | Binance websocket `<symbol>@aggTrade`, every aggregated trade | realtime |
 | `options_deribit` | Deribit `public/get_book_summary_by_currency` option chain | 1h |
 
-Symbols: BTCUSDT + ETHUSDT (Binance), BTC (Deribit). Edit `CONFIG` in
-`recorder.py` to change.
+Symbols: BTCUSDT + ETHUSDT + SOLUSDT (Binance), BTC (Deribit). Edit `CONFIG`
+in `recorder.py` to change.
 
 ## Data format / 資料格式
 
